@@ -159,6 +159,10 @@ os.execvp("gdb", [
 ])
 ```
 
+At this point, we can confirm that the overflow is real. The argument ending with a backslash causes the copy loop to skip the null terminator and continue copying data past the end of the allocated user_args chunk.
+
+This gives us a controlled heap overflow primitive. In this test case, the overflow reaches the metadata of the next heap chunk, including the chunk size field.
+
 ![alt text](image/image.png)
 
 ## Exploit Strategy
